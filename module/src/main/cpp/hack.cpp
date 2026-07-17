@@ -20,6 +20,7 @@
 void scan_and_dump_metadata(const char *game_data_dir);
 
 static void *g_il2cpp_handle = nullptr;
+static uint64_t g_meta_addr = 0;
 void hack_start(const char *game_data_dir) {
     for (int i = 0; i < 12; i++) {
         void *h = xdl_open("libniolange.so", 0);
@@ -226,6 +227,7 @@ static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
         if (b[i]==0xAF && b[i+1]==0x1B && b[i+2]==0xB1 && b[i+3]==0xFA) {
             uint32_t ver; memcpy(&ver, b+i+4, 4);
             if (ver>=20 && ver<=40) {
+                g_meta_addr=(uint64_t)(b+i);
                 size_t avail=len-i; size_t dsize=avail<(size_t)45*1024*1024?avail:(size_t)45*1024*1024;
                 FILE *f=fopen(outpath,"wb");
                 if (f) { fwrite(b+i,1,dsize,f); fclose(f);
@@ -242,26 +244,18 @@ static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
 // base~end 통째로 덤프한다. 정적 APK 의 libniolange.so 는 packed 라 CodeRegistration 을 못 찾지만,
 // 런타임 메모리 이미지는 언팩돼 있어 Il2CppDumper/Inspector 가 등록부를 찾을 수 있다.
 static void dump_module_memory(const char *game_data_dir) {
-    if (!g_il2cpp_handle) { LOGW("no il2cpp handle"); return; }
-    xdl_info_t xi; memset(&xi, 0, sizeof(xi));
-    if (xdl_info(g_il2cpp_handle, XDL_DI_DLINFO, &xi) != 0 || xi.dli_fbase == nullptr) { LOGW("xdl_info fail"); return; }
-    uint64_t base = (uint64_t)xi.dli_fbase, end = base;
-    FILE *maps = fopen("/proc/self/maps", "r");
-    if (maps) { char line[512]; while (fgets(line, sizeof(line), maps)) {
-        uint64_t s2,e2; if (sscanf(line,"%llx-%llx",(unsigned long long*)&s2,(unsigned long long*)&e2)!=2) continue;
-        if (s2 >= base && s2 <= end + 0x200000) { if (e2 > end) end = e2; } } fclose(maps); }
-    if (end <= base) end = base + (uint64_t)200*1024*1024;
-    size_t total = (size_t)(end - base);
-    if (total > (size_t)400*1024*1024) total = (size_t)400*1024*1024;
-    char outp[512]; snprintf(outp,sizeof(outp),"%s/libniolange_dump.so",game_data_dir);
-    FILE *f=fopen(outp,"wb"); if(!f){LOGW("module dump open fail");return;}
+    if (g_meta_addr == 0) { LOGW("no meta addr"); return; }
+    uint64_t base = g_meta_addr & ~0xFFFFFULL;         // metadata 영역 시작(base 아래) 부터
+    size_t total = (size_t)220*1024*1024;              // metadata+gap+code+registrations 포괄
+    char outp[512]; snprintf(outp,sizeof(outp),"%s/mem_comprehensive.bin",game_data_dir);
+    FILE *f=fopen(outp,"wb"); if(!f){LOGW("comp dump open fail");return;}
     const size_t PG=4096; unsigned char zero[PG]; memset(zero,0,PG);
     struct sigaction sa{},old{}; sa.sa_handler=segv_handler; sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV,&sa,&old); sigaction(SIGBUS,&sa,nullptr);
     for(size_t off=0; off<total; off+=PG){ const unsigned char *pg=(const unsigned char*)(base+off);
         if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; } fwrite(pg,1,PG,f); }
     sigaction(SIGSEGV,&old,nullptr); fclose(f);
-    LOGI("MODULE DUMPED base=0x%llx size=%zu -> %s", (unsigned long long)base, total, outp);
+    LOGI("COMPREHENSIVE DUMPED base=0x%llx size=%zu -> %s", (unsigned long long)base, total, outp);
 }
 
 void scan_and_dump_metadata(const char *game_data_dir) {
@@ -287,9 +281,7 @@ void scan_and_dump_metadata(const char *game_data_dir) {
             LOGI("scan SUCCESS attempt=%d", attempt);
             sigaction(SIGSEGV,&old,nullptr);
             dump_module_memory(game_data_dir);
-            sleep(3);  // il2cpp 완전 init + 등록부 세팅 대기
-            LOGI("FREEZE_NOW pid=%d — SIGSTOP (root full-memory dump 대기)", getpid());
-            kill(getpid(), SIGSTOP);   // 게임 동결 -> 안티치트 kill 회피, root가 여유롭게 덤프
+            LOGI("ALL DONE");
             return;
         }
         LOGI("attempt %d scanned %d regions, no magic", attempt, scanned);
