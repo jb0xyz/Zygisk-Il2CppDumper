@@ -17,22 +17,15 @@
 #include <linux/unistd.h>
 #include <array>
 
+void scan_and_dump_metadata(const char *game_data_dir);
+
 void hack_start(const char *game_data_dir) {
-    bool load = false;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 12; i++) {
         void *handle = xdl_open("libniolange.so", 0);
-        if (handle) {
-            load = true;
-            il2cpp_api_init(handle);
-            il2cpp_dump(game_data_dir);
-            break;
-        } else {
-            sleep(1);
-        }
+        if (handle) { LOGI("libniolange.so loaded, starting memory metadata scan"); break; }
+        sleep(1);
     }
-    if (!load) {
-        LOGI("libil2cpp.so not found in thread %d", gettid());
-    }
+    scan_and_dump_metadata(game_data_dir);
 }
 
 std::string GetLibDir(JavaVM *vms) {
@@ -210,3 +203,60 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 #endif
+// scan_and_dump_metadata: niolange가 il2cpp export 심볼을 stripped 하여 API 덤프가 불가하므로,
+// 프로세스 메모리에서 복호된 global-metadata.dat(매직 0xFAB11BAF = AF 1B B1 FA + version)을
+// 직접 스캔해 덤프한다. in-process, /proc/self/mem 를 pread 로 안전하게 읽는다.
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <unistd.h>
+#include <fcntl.h>
+#include "log.h"
+
+static bool dump_one(int memfd, uint64_t start, uint64_t end, const char *outpath) {
+    static const unsigned char MAGIC[4] = {0xAF,0x1B,0xB1,0xFA};
+    size_t rsize = end - start;
+    if (rsize == 0 || rsize > (size_t)1536*1024*1024) return false;
+    unsigned char *buf = (unsigned char *)malloc(rsize);
+    if (!buf) return false;
+    ssize_t n = pread64(memfd, buf, rsize, (off64_t)start);
+    if (n <= 4) { free(buf); return false; }
+    for (ssize_t i = 0; i + 8 < n; i++) {
+        if (buf[i]==MAGIC[0] && buf[i+1]==MAGIC[1] && buf[i+2]==MAGIC[2] && buf[i+3]==MAGIC[3]) {
+            uint32_t ver; memcpy(&ver, buf+i+4, 4);
+            if (ver >= 20 && ver <= 40) {
+                size_t avail = n - i;
+                size_t dsize = avail < (size_t)45*1024*1024 ? avail : (size_t)45*1024*1024;
+                FILE *f = fopen(outpath, "wb");
+                if (f) { fwrite(buf+i, 1, dsize, f); fclose(f);
+                    LOGI("METADATA DUMPED %zu bytes ver=%u at 0x%llx", dsize, ver, (unsigned long long)(start+i)); }
+                free(buf); return true;
+            }
+        }
+    }
+    free(buf); return false;
+}
+
+void scan_and_dump_metadata(const char *game_data_dir) {
+    char outpath[512];
+    snprintf(outpath, sizeof(outpath), "%s/global-metadata.dat", game_data_dir);
+    // il2cpp_init + niolange 복호 대기하며 반복 스캔 (게임이 안티치트로 죽기 전 창)
+    for (int attempt = 0; attempt < 15; attempt++) {
+        sleep(1);
+        int memfd = open("/proc/self/mem", O_RDONLY);
+        if (memfd < 0) { LOGW("open mem fail"); continue; }
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (!maps) { close(memfd); continue; }
+        char line[512]; bool done = false;
+        while (fgets(line, sizeof(line), maps)) {
+            uint64_t s, e; char perms[8];
+            if (sscanf(line, "%llx-%llx %7s", (unsigned long long*)&s, (unsigned long long*)&e, perms) != 3) continue;
+            if (perms[0] != 'r') continue;
+            if (dump_one(memfd, s, e, outpath)) { done = true; break; }
+        }
+        fclose(maps); close(memfd);
+        if (done) { LOGI("scan_and_dump_metadata: SUCCESS attempt=%d", attempt); return; }
+    }
+    LOGW("scan_and_dump_metadata: metadata magic not found (on-demand decryption?)");
+}
