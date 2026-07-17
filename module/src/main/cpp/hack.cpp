@@ -240,26 +240,65 @@ static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
 }
 
 
-// dump_module_memory: 런타임에 복호/언팩된 libniolange.so 의 메모리 영역(모든 세그먼트)을
-// base~end 통째로 덤프한다. 정적 APK 의 libniolange.so 는 packed 라 CodeRegistration 을 못 찾지만,
-// 런타임 메모리 이미지는 언팩돼 있어 Il2CppDumper/Inspector 가 등록부를 찾을 수 있다.
-static void dump_module_memory(const char *game_data_dir) {
-    if (g_meta_addr == 0) { LOGW("no meta addr"); return; }
-    uint64_t base = g_meta_addr & ~0xFFFFFULL;         // metadata 영역 시작(base 아래) 부터
-    size_t total = (size_t)220*1024*1024;              // metadata+gap+code+registrations 포괄
-    char outp[512]; snprintf(outp,sizeof(outp),"%s/mem_comprehensive.bin",game_data_dir);
-    FILE *f=fopen(outp,"wb"); if(!f){LOGW("comp dump open fail");return;}
+// dump_region_segv: 한 영역을 페이지 단위 segv-safe 로 파일에 append. 반환=쓴 바이트.
+static size_t dump_region_segv(uint64_t start, size_t sz, FILE *f) {
     const size_t PG=4096; unsigned char zero[PG]; memset(zero,0,PG);
+    size_t written=0;
+    for (size_t off=0; off<sz; off+=PG) {
+        const unsigned char *pg=(const unsigned char*)(start+off);
+        size_t chunk=(sz-off<PG)?(sz-off):PG;
+        if (sigsetjmp(g_jmp,1)) { fwrite(zero,1,chunk,f); written+=chunk; continue; }
+        fwrite(pg,1,chunk,f); written+=chunk;
+    }
+    return written;
+}
+
+// dump_all_regions: /proc/self/maps 의 모든 읽기가능 anon(+niolange) 영역을 in-process 로 덤프.
+// niolange 는 il2cpp 코드/데이터/registration 을 익명메모리에 언팩하므로, meta_addr 상하 위치를
+// 가리지 않고 전부 캡처해야 Il2CppDumper 가 CodeRegistration/MetadataRegistration 을 찾는다.
+// manifest(allmem.man: vaddr fileoff size perms path)로 offline 에서 정확한 VA 매핑 ELF 재구성.
+static void dump_all_regions(const char *game_data_dir) {
+    char binp[512], manp[512], infop[512];
+    snprintf(binp,sizeof(binp),"%s/allmem.bin",game_data_dir);
+    snprintf(manp,sizeof(manp),"%s/allmem.man",game_data_dir);
+    snprintf(infop,sizeof(infop),"%s/dumpinfo.txt",game_data_dir);
+    FILE *out=fopen(binp,"wb"); FILE *man=fopen(manp,"w");
+    if(!out||!man){ LOGW("allmem open fail"); if(out)fclose(out); if(man)fclose(man); return; }
+
+    uint64_t nio_base=0;
+    { FILE *mp=fopen("/proc/self/maps","r"); char l[600];
+      while(mp&&fgets(l,sizeof(l),mp)){ if(strstr(l,"libniolange.so")){ sscanf(l,"%llx",(unsigned long long*)&nio_base); break; } }
+      if(mp)fclose(mp); }
+    FILE *inf=fopen(infop,"w");
+    if(inf){ fprintf(inf,"meta_addr=0x%llx\nniolange_base=0x%llx\n",
+        (unsigned long long)g_meta_addr,(unsigned long long)nio_base); fclose(inf); }
+
     struct sigaction sa{},old{}; sa.sa_handler=segv_handler; sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV,&sa,&old); sigaction(SIGBUS,&sa,nullptr);
-    for(size_t off=0; off<total; off+=PG){ const unsigned char *pg=(const unsigned char*)(base+off);
-        if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; } fwrite(pg,1,PG,f); }
-    sigaction(SIGSEGV,&old,nullptr); fclose(f);
-    LOGI("COMPREHENSIVE DUMPED base=0x%llx size=%zu -> %s", (unsigned long long)base, total, outp);
-    char infop[512]; snprintf(infop,sizeof(infop),"%s/dumpinfo.txt",game_data_dir);
-    FILE *inf=fopen(infop,"w");
-    if(inf){ fprintf(inf,"comp_base=0x%llx\nmeta_addr=0x%llx\ncomp_size=%zu\n",
-        (unsigned long long)base,(unsigned long long)g_meta_addr,total); fclose(inf); }
+
+    FILE *maps=fopen("/proc/self/maps","r");
+    char line[600]; uint64_t foff=0; int regions=0;
+    while(maps&&fgets(line,sizeof(line),maps)){
+        uint64_t s,e; char perms[8]={0}; char rest[512]={0};
+        if(sscanf(line,"%llx-%llx %7s %*x %*x:%*x %*u %511[^\n]",
+                  (unsigned long long*)&s,(unsigned long long*)&e,perms,rest)<3) continue;
+        if(perms[0]!='r') continue;
+        char *p=rest; while(*p==' ')p++;
+        bool is_anon=(*p==0)||strncmp(p,"[anon",5)==0||strcmp(p,"[heap]")==0||strcmp(p,"[stack]")==0;
+        bool is_nio=strstr(p,"niolange")!=nullptr;
+        if(!is_anon&&!is_nio) continue;
+        uint64_t sz=e-s;
+        if(sz==0||sz>(uint64_t)450*1024*1024) continue;
+        size_t w=dump_region_segv(s,(size_t)sz,out);
+        fprintf(man,"0x%llx %llu %llu %s %s\n",(unsigned long long)s,
+            (unsigned long long)foff,(unsigned long long)sz,perms,(*p?p:"[anon]"));
+        fflush(man); foff+=w; regions++;
+    }
+    if(maps)fclose(maps);
+    sigaction(SIGSEGV,&old,nullptr);
+    fclose(out); fclose(man);
+    LOGI("ALL REGIONS DUMPED regions=%d total=%llu meta=0x%llx nio=0x%llx",
+        regions,(unsigned long long)foff,(unsigned long long)g_meta_addr,(unsigned long long)nio_base);
 }
 
 void scan_and_dump_metadata(const char *game_data_dir) {
@@ -284,7 +323,7 @@ void scan_and_dump_metadata(const char *game_data_dir) {
         if (done) {
             LOGI("scan SUCCESS attempt=%d", attempt);
             sigaction(SIGSEGV,&old,nullptr);
-            dump_module_memory(game_data_dir);
+            dump_all_regions(game_data_dir);
             LOGI("ALL DONE");
             return;
         }
