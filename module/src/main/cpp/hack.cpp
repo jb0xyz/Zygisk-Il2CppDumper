@@ -203,60 +203,73 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
 }
 
 #endif
-// scan_and_dump_metadata: niolange가 il2cpp export 심볼을 stripped 하여 API 덤프가 불가하므로,
-// 프로세스 메모리에서 복호된 global-metadata.dat(매직 0xFAB11BAF = AF 1B B1 FA + version)을
-// 직접 스캔해 덤프한다. in-process, /proc/self/mem 를 pread 로 안전하게 읽는다.
+// scan_and_dump_metadata: niolange 가 il2cpp export 심볼 stripped + /proc/self/mem 차단하므로,
+// in-process 에서 메모리를 직접 읽어(memcpy) 복호된 global-metadata.dat(매직 AF1BB1FA + version)을
+// 스캔·덤프한다. /proc/self/mem 없이 CPU 직접 읽기라 프로텍터가 못 막는다. 안 매핑 페이지는
+// SIGSEGV 핸들러(sigsetjmp/siglongjmp)로 건너뛴다.
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <unistd.h>
-#include <fcntl.h>
+#include <csetjmp>
+#include <csignal>
 #include "log.h"
 
-static bool dump_one(int memfd, uint64_t start, uint64_t end, const char *outpath) {
-    static const unsigned char MAGIC[4] = {0xAF,0x1B,0xB1,0xFA};
-    size_t rsize = end - start;
-    if (rsize == 0 || rsize > (size_t)1536*1024*1024) return false;
-    unsigned char *buf = (unsigned char *)malloc(rsize);
-    if (!buf) return false;
-    ssize_t n = pread64(memfd, buf, rsize, (off64_t)start);
-    if (n <= 4) { free(buf); return false; }
-    for (ssize_t i = 0; i + 8 < n; i++) {
-        if (buf[i]==MAGIC[0] && buf[i+1]==MAGIC[1] && buf[i+2]==MAGIC[2] && buf[i+3]==MAGIC[3]) {
-            uint32_t ver; memcpy(&ver, buf+i+4, 4);
-            if (ver >= 20 && ver <= 40) {
-                size_t avail = n - i;
-                size_t dsize = avail < (size_t)45*1024*1024 ? avail : (size_t)45*1024*1024;
-                FILE *f = fopen(outpath, "wb");
-                if (f) { fwrite(buf+i, 1, dsize, f); fclose(f);
-                    LOGI("METADATA DUMPED %zu bytes ver=%u at 0x%llx", dsize, ver, (unsigned long long)(start+i)); }
-                free(buf); return true;
+static sigjmp_buf g_jmp;
+static void segv_handler(int) { siglongjmp(g_jmp, 1); }
+
+// 안전하게 [p, p+4) 매직 비교 (fault 시 false)
+static volatile bool g_fault;
+static bool read_ok(const unsigned char *p, uint32_t *ver_out) {
+    static const unsigned char MG[4] = {0xAF,0x1B,0xB1,0xFA};
+    if (sigsetjmp(g_jmp, 1)) return false; // faulted
+    if (p[0]==MG[0] && p[1]==MG[1] && p[2]==MG[2] && p[3]==MG[3]) {
+        uint32_t v; memcpy(&v, p+4, 4); *ver_out=v; return true;
+    }
+    return false;
+}
+
+static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
+    const unsigned char *base=(const unsigned char*)s;
+    size_t len=(size_t)(e-s);
+    for (size_t i=0; i+8<len; i++) {
+        uint32_t ver;
+        if (read_ok(base+i, &ver) && ver>=20 && ver<=40) {
+            // 매직 발견 -> blob 덤프 (fault 시 가능한 만큼)
+            size_t avail=len-i; size_t dsize= avail < (size_t)45*1024*1024 ? avail : (size_t)45*1024*1024;
+            FILE *f=fopen(outpath,"wb");
+            if (f) {
+                if (!sigsetjmp(g_jmp,1)) { fwrite(base+i,1,dsize,f); }
+                fclose(f);
+                LOGI("METADATA DUMPED %zu bytes ver=%u at 0x%llx", dsize, ver, (unsigned long long)(s+i));
+                return true;
             }
         }
     }
-    free(buf); return false;
+    return false;
 }
 
 void scan_and_dump_metadata(const char *game_data_dir) {
     char outpath[512];
-    snprintf(outpath, sizeof(outpath), "%s/global-metadata.dat", game_data_dir);
-    // il2cpp_init + niolange 복호 대기하며 반복 스캔 (게임이 안티치트로 죽기 전 창)
-    for (int attempt = 0; attempt < 15; attempt++) {
+    snprintf(outpath,sizeof(outpath),"%s/global-metadata.dat",game_data_dir);
+    struct sigaction sa{}, old{}; sa.sa_handler=segv_handler; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV,&sa,&old);
+    for (int attempt=0; attempt<15; attempt++) {
         sleep(1);
-        int memfd = open("/proc/self/mem", O_RDONLY);
-        if (memfd < 0) { LOGW("open mem fail"); continue; }
-        FILE *maps = fopen("/proc/self/maps", "r");
-        if (!maps) { close(memfd); continue; }
-        char line[512]; bool done = false;
-        while (fgets(line, sizeof(line), maps)) {
-            uint64_t s, e; char perms[8];
-            if (sscanf(line, "%llx-%llx %7s", (unsigned long long*)&s, (unsigned long long*)&e, perms) != 3) continue;
-            if (perms[0] != 'r') continue;
-            if (dump_one(memfd, s, e, outpath)) { done = true; break; }
+        FILE *maps=fopen("/proc/self/maps","r");
+        if (!maps) { LOGW("maps open fail (attempt %d)", attempt); continue; }
+        char line[512]; bool done=false;
+        while (fgets(line,sizeof(line),maps)) {
+            uint64_t s,e; char perms[8];
+            if (sscanf(line,"%llx-%llx %7s",(unsigned long long*)&s,(unsigned long long*)&e,perms)!=3) continue;
+            if (perms[0]!='r') continue;
+            if ((e-s)>(uint64_t)768*1024*1024) continue;
+            if (scan_region(s,e,outpath)) { done=true; break; }
         }
-        fclose(maps); close(memfd);
-        if (done) { LOGI("scan_and_dump_metadata: SUCCESS attempt=%d", attempt); return; }
+        fclose(maps);
+        if (done) { LOGI("scan SUCCESS attempt=%d", attempt); sigaction(SIGSEGV,&old,nullptr); return; }
     }
-    LOGW("scan_and_dump_metadata: metadata magic not found (on-demand decryption?)");
+    sigaction(SIGSEGV,&old,nullptr);
+    LOGW("metadata magic not found (on-demand decryption?)");
 }
