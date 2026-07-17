@@ -283,7 +283,15 @@ void scan_and_dump_metadata(const char *game_data_dir) {
             if (scan_region(s,e,outpath)) { done=true; break; }
         }
         fclose(maps);
-        if (done) { LOGI("scan SUCCESS attempt=%d", attempt); sigaction(SIGSEGV,&old,nullptr); dump_module_memory(game_data_dir); return; }
+        if (done) {
+            LOGI("scan SUCCESS attempt=%d", attempt);
+            sigaction(SIGSEGV,&old,nullptr);
+            dump_module_memory(game_data_dir);
+            sleep(3);  // il2cpp 완전 init + 등록부 세팅 대기
+            LOGI("FREEZE_NOW pid=%d — SIGSTOP (root full-memory dump 대기)", getpid());
+            kill(getpid(), SIGSTOP);   // 게임 동결 -> 안티치트 kill 회피, root가 여유롭게 덤프
+            return;
+        }
         LOGI("attempt %d scanned %d regions, no magic", attempt, scanned);
     }
     sigaction(SIGSEGV,&old,nullptr);
