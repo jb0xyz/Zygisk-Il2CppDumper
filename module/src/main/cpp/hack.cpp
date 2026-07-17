@@ -236,6 +236,43 @@ static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
     return false;
 }
 
+
+// dump_module_memory: 런타임에 복호/언팩된 libniolange.so 의 메모리 영역(모든 세그먼트)을
+// base~end 통째로 덤프한다. 정적 APK 의 libniolange.so 는 packed 라 CodeRegistration 을 못 찾지만,
+// 런타임 메모리 이미지는 언팩돼 있어 Il2CppDumper/Inspector 가 등록부를 찾을 수 있다.
+static void dump_module_memory(const char *game_data_dir) {
+    uint64_t base=0, end=0;
+    FILE *maps=fopen("/proc/self/maps","r");
+    if(!maps) return;
+    char line[512];
+    while(fgets(line,sizeof(line),maps)){
+        if(!strstr(line,"libniolange.so")) continue;
+        uint64_t s,e;
+        if(sscanf(line,"%llx-%llx",(unsigned long long*)&s,(unsigned long long*)&e)!=2) continue;
+        if(base==0||s<base) base=s;
+        if(e>end) end=e;
+    }
+    fclose(maps);
+    if(base==0||end<=base) { LOGW("libniolange.so range not found"); return; }
+    size_t total=(size_t)(end-base);
+    char outp[512]; snprintf(outp,sizeof(outp),"%s/libniolange_dump.so",game_data_dir);
+    FILE *f=fopen(outp,"wb");
+    if(!f){ LOGW("open module dump fail"); return; }
+    // 세그먼트별로 안전하게 (unmapped hole 은 0 으로) 4KB 페이지 단위 복사
+    const size_t PG=4096;
+    struct sigaction sa{},old{}; sa.sa_handler=segv_handler; sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV,&sa,&old); sigaction(SIGBUS,&sa,nullptr);
+    unsigned char zero[PG]; memset(zero,0,PG);
+    for(size_t off=0; off<total; off+=PG){
+        const unsigned char *pg=(const unsigned char*)(base+off);
+        if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; }
+        fwrite(pg,1,PG,f);
+    }
+    sigaction(SIGSEGV,&old,nullptr);
+    fclose(f);
+    LOGI("MODULE DUMPED %zu bytes base=0x%llx -> %s", total,(unsigned long long)base,outp);
+}
+
 void scan_and_dump_metadata(const char *game_data_dir) {
     char outpath[512];
     snprintf(outpath,sizeof(outpath),"%s/global-metadata.dat",game_data_dir);
@@ -255,7 +292,7 @@ void scan_and_dump_metadata(const char *game_data_dir) {
             if (scan_region(s,e,outpath)) { done=true; break; }
         }
         fclose(maps);
-        if (done) { LOGI("scan SUCCESS attempt=%d", attempt); sigaction(SIGSEGV,&old,nullptr); return; }
+        if (done) { LOGI("scan SUCCESS attempt=%d", attempt); sigaction(SIGSEGV,&old,nullptr); dump_module_memory(game_data_dir); return; }
         LOGI("attempt %d scanned %d regions, no magic", attempt, scanned);
     }
     sigaction(SIGSEGV,&old,nullptr);
