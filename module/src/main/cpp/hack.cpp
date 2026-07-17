@@ -19,10 +19,11 @@
 
 void scan_and_dump_metadata(const char *game_data_dir);
 
+static void *g_il2cpp_handle = nullptr;
 void hack_start(const char *game_data_dir) {
     for (int i = 0; i < 12; i++) {
-        void *handle = xdl_open("libniolange.so", 0);
-        if (handle) { LOGI("libniolange.so loaded, starting memory metadata scan"); break; }
+        void *h = xdl_open("libniolange.so", 0);
+        if (h) { g_il2cpp_handle = h; LOGI("libniolange.so loaded, base via xdl"); break; }
         sleep(1);
     }
     scan_and_dump_metadata(game_data_dir);
@@ -241,36 +242,26 @@ static bool scan_region(uint64_t s, uint64_t e, const char *outpath) {
 // base~end 통째로 덤프한다. 정적 APK 의 libniolange.so 는 packed 라 CodeRegistration 을 못 찾지만,
 // 런타임 메모리 이미지는 언팩돼 있어 Il2CppDumper/Inspector 가 등록부를 찾을 수 있다.
 static void dump_module_memory(const char *game_data_dir) {
-    uint64_t base=0, end=0;
-    FILE *maps=fopen("/proc/self/maps","r");
-    if(!maps) return;
-    char line[512];
-    while(fgets(line,sizeof(line),maps)){
-        if(!strstr(line,"libniolange.so")) continue;
-        uint64_t s,e;
-        if(sscanf(line,"%llx-%llx",(unsigned long long*)&s,(unsigned long long*)&e)!=2) continue;
-        if(base==0||s<base) base=s;
-        if(e>end) end=e;
-    }
-    fclose(maps);
-    if(base==0||end<=base) { LOGW("libniolange.so range not found"); return; }
-    size_t total=(size_t)(end-base);
+    if (!g_il2cpp_handle) { LOGW("no il2cpp handle"); return; }
+    xdl_info_t xi; memset(&xi, 0, sizeof(xi));
+    if (xdl_info(g_il2cpp_handle, XDL_DI_DLINFO, &xi) != 0 || xi.dli_fbase == nullptr) { LOGW("xdl_info fail"); return; }
+    uint64_t base = (uint64_t)xi.dli_fbase, end = base;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (maps) { char line[512]; while (fgets(line, sizeof(line), maps)) {
+        uint64_t s2,e2; if (sscanf(line,"%llx-%llx",(unsigned long long*)&s2,(unsigned long long*)&e2)!=2) continue;
+        if (s2 >= base && s2 <= end + 0x200000) { if (e2 > end) end = e2; } } fclose(maps); }
+    if (end <= base) end = base + (uint64_t)200*1024*1024;
+    size_t total = (size_t)(end - base);
+    if (total > (size_t)400*1024*1024) total = (size_t)400*1024*1024;
     char outp[512]; snprintf(outp,sizeof(outp),"%s/libniolange_dump.so",game_data_dir);
-    FILE *f=fopen(outp,"wb");
-    if(!f){ LOGW("open module dump fail"); return; }
-    // 세그먼트별로 안전하게 (unmapped hole 은 0 으로) 4KB 페이지 단위 복사
-    const size_t PG=4096;
+    FILE *f=fopen(outp,"wb"); if(!f){LOGW("module dump open fail");return;}
+    const size_t PG=4096; unsigned char zero[PG]; memset(zero,0,PG);
     struct sigaction sa{},old{}; sa.sa_handler=segv_handler; sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV,&sa,&old); sigaction(SIGBUS,&sa,nullptr);
-    unsigned char zero[PG]; memset(zero,0,PG);
-    for(size_t off=0; off<total; off+=PG){
-        const unsigned char *pg=(const unsigned char*)(base+off);
-        if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; }
-        fwrite(pg,1,PG,f);
-    }
-    sigaction(SIGSEGV,&old,nullptr);
-    fclose(f);
-    LOGI("MODULE DUMPED %zu bytes base=0x%llx -> %s", total,(unsigned long long)base,outp);
+    for(size_t off=0; off<total; off+=PG){ const unsigned char *pg=(const unsigned char*)(base+off);
+        if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; } fwrite(pg,1,PG,f); }
+    sigaction(SIGSEGV,&old,nullptr); fclose(f);
+    LOGI("MODULE DUMPED base=0x%llx size=%zu -> %s", (unsigned long long)base, total, outp);
 }
 
 void scan_and_dump_metadata(const char *game_data_dir) {
