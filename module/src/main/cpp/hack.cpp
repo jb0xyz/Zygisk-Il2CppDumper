@@ -256,6 +256,10 @@ static void dump_module_memory(const char *game_data_dir) {
         if(sigsetjmp(g_jmp,1)){ fwrite(zero,1,PG,f); continue; } fwrite(pg,1,PG,f); }
     sigaction(SIGSEGV,&old,nullptr); fclose(f);
     LOGI("COMPREHENSIVE DUMPED base=0x%llx size=%zu -> %s", (unsigned long long)base, total, outp);
+    char infop[512]; snprintf(infop,sizeof(infop),"%s/dumpinfo.txt",game_data_dir);
+    FILE *inf=fopen(infop,"w");
+    if(inf){ fprintf(inf,"comp_base=0x%llx\nmeta_addr=0x%llx\ncomp_size=%zu\n",
+        (unsigned long long)base,(unsigned long long)g_meta_addr,total); fclose(inf); }
 }
 
 void scan_and_dump_metadata(const char *game_data_dir) {
